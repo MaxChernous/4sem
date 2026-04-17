@@ -2,172 +2,154 @@ from mpi4py import MPI
 from petsc4py import PETSc
 import numpy as np
 import ufl
-from dolfinx import la
-from dolfinx.fem import (Expression, Function, dirichletbc,
-                         form, functionspace, locate_dofs_topological)
-from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting
-from dolfinx.io import XDMFFile
-from dolfinx.mesh import CellType, GhostMode, create_box, locate_entities_boundary
-
+from dolfinx import fem, mesh, la
 from dolfinx.fem.petsc import NonlinearProblem
 from dolfinx.nls.petsc import NewtonSolver
-
-from dolfinx.fem import Constant
-
-from dolfinx import fem
 from dolfinx.io import VTXWriter
 
-dtype = PETSc.ScalarType
+# --- 1. ГЕОМЕТРИЯ (в метрах) ---
+# 10x10 мм, толщина 1.2 мм
+L, W = 10.0e-3, 10.0e-3
+th_Mo, th_Cer = 0.2e-3, 0.3e-3
+total_thickness = 3*th_Mo + 2*th_Cer
 
-# --- 1. Геометрия берестинки ---
-length, width, thickness = 2.0, 1.0, 0.025
-msh = create_box(MPI.COMM_WORLD, [np.array([0.0, 0.0, 0.0]), np.array([length, width, thickness])],
-                 (60, 20, 5), CellType.tetrahedron)
+# Создаем сетку (40x40x20 ячеек, чтобы хорошо разрешить 5 слоев)
+msh = mesh.create_box(MPI.COMM_WORLD, 
+                      [np.array([0, 0, 0]), np.array([L, W, total_thickness])],
+                      (40, 40, 20), mesh.CellType.tetrahedron)
 
-msh.topology.create_entities(1)
-msh.topology.create_connectivity(1, msh.topology.dim)
+# Пространство для перемещений (Lagrange P1)
+V = fem.functionspace(msh, ("Lagrange", 1, (3,)))
 
-V = functionspace(msh, ("Lagrange", 1, (3,)))
+# --- 2. СВОЙСТВА МАТЕРИАЛОВ (ПО СЛОЯМ) ---
+# Создаем пространство DG0 (одно значение на каждую ячейку сетки)
+V_prop = fem.functionspace(msh, ("DG", 0))
 
-# --- 2. Физическа берестинки ---
-E, ν = 0.5e9, 0.3
-μ, λ = E / (2*(1+ν)), E*ν / ((1+ν)*(1-2*ν))
-dT = 300.0
+E_field = fem.Function(V_prop)
+nu_field = fem.Function(V_prop)
+alpha_field = fem.Function(V_prop)
 
-x = ufl.SpatialCoordinate(msh)
-z_norm = x[2] - thickness / 2.0
-x_norm = x[0] - length / 2.0
+# Границы слоев по Z
+z_bounds = [
+    0.0, 
+    th_Mo, 
+    th_Mo + th_Cer, 
+    2*th_Mo + th_Cer, 
+    2*th_Mo + 2*th_Cer, 
+    total_thickness
+]
 
-# Ориентация волокон (чтобы спиралька)
-theta = 0.65 * x[1]
+def map_properties(x):
+    # По умолчанию - Молибден (индексы слоев 0, 2, 4)
+    # E=320 ГПа, nu=0.31, alpha=5.2e-6
+    e_vals = np.full(x.shape[1], 320.0e9)
+    n_vals = np.full(x.shape[1], 0.31)
+    a_vals = np.full(x.shape[1], 5.2e-6)
+    
+    # Керамика (индексы слоев 1, 3)
+    # E=297 ГПа, nu=0.25, alpha=6.0e-6
+    is_cer1 = (x[2] >= z_bounds[1]) & (x[2] <= z_bounds[2])
+    is_cer2 = (x[2] >= z_bounds[3]) & (x[2] <= z_bounds[4])
+    mask_cer = is_cer1 | is_cer2
+    
+    e_vals[mask_cer] = 297.0e9
+    n_vals[mask_cer] = 0.25
+    a_vals[mask_cer] = 6.0e-6
+    return e_vals, n_vals, a_vals
 
-R = ufl.as_tensor([
-    [ufl.cos(theta), -ufl.sin(theta), 0],
-    [ufl.sin(theta),  ufl.cos(theta), 0],
-    [0, 0, 1]
-])
+# Интерполируем свойства в ячейки
+e_data, n_data, a_data = map_properties(msh.geometry.x.T)
+# Для DG0 нужно заполнить массив значений напрямую через ячейки или через интерполяцию
+# Самый надежный способ для слоев - функция с проверкой координат
+def e_expr(x): return map_properties(x)[0]
+def n_expr(x): return map_properties(x)[1]
+def a_expr(x): return map_properties(x)[2]
 
-alpha_max = 5e-4
+E_field.interpolate(e_expr)
+nu_field.interpolate(n_expr)
+alpha_field.interpolate(a_expr)
 
-alpha_local = ufl.as_tensor([
-    [alpha_max * (z_norm / (thickness / 2.0)) * (1 + 0.1 * x_norm / (length / 2.0)), 0, 0],
-    [0, 1e-6, 0],
-    [0, 0, 1e-6]
-])
+# --- 3. ФИЗИКА И УРАВНЕНИЯ ---
+# Параметры Ламэ теперь тоже поля
+mu = E_field / (2 * (1 + nu_field))
+lmbda = E_field * nu_field / ((1 + nu_field) * (1 - 2 * nu_field))
 
-# Поворот α вместе с системой координат
-alpha_tensor = R * alpha_local * R.T
+# Тензор КТР (теперь изотропный, но разный в слоях)
+alpha_tensor = alpha_field * ufl.Identity(3)
 
-# ассиметрия по ширине
-alpha_tensor = alpha_tensor * (1 + 0.2 * x[1] / width)
-
-# --- Нелинейная кинематика ---
+# Нелинейная кинематика (Green-Lagrange)
 I = ufl.Identity(3)
-
-def F_def(u):
-    return I + ufl.grad(u)
-
 def E_GL(u):
-    F = F_def(u)
+    F = I + ufl.grad(u)
     return 0.5 * (F.T * F - I)
 
-# --- 3. Граничные условия ---
-msh.topology.create_entities(2)
-msh.topology.create_connectivity(2, msh.topology.dim)
-
-def left_face(x):
-    return np.isclose(x[0], 0.0)
-
-face_entities = locate_entities_boundary(msh, dim=2, marker=left_face)
-dofs = locate_dofs_topological(V, entity_dim=2, entities=face_entities)
-bc = dirichletbc(np.zeros(3, dtype=dtype), dofs, V)
-
-# --- 4. Нелинейная задача ---
-u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
-dx = ufl.dx(domain=msh)
-
-u = Function(V)
+u = fem.Function(V)
 v = ufl.TestFunction(V)
+dT_eff = fem.Constant(msh, PETSc.ScalarType(0.0))
 
-dT_eff = Constant(msh, PETSc.ScalarType(0.0))
+# Энергия с учетом теплового расширения
+def psi(u):
+    E_strain = E_GL(u) - alpha_tensor * dT_eff
+    return mu * ufl.inner(E_strain, E_strain) + 0.5 * lmbda * (ufl.tr(E_strain))**2
 
-# Энергия деформации
-def psi_step(u):
-    E = E_GL(u) - alpha_tensor * dT_eff
-    return μ * ufl.inner(E, E) + 0.5 * λ * (ufl.tr(E))**2
-
-Pi = psi_step(u) * dx
+dx = ufl.dx
+Pi = psi(u) * dx
 F_res = ufl.derivative(Pi, u, v)
 J = ufl.derivative(F_res, u, ufl.TrialFunction(V))
 
-problem = NonlinearProblem(
-    F_res, u,
-    bcs=[bc],
-    J=J
-)
+# --- 4. ГРАНИЧНЫЕ УСЛОВИЯ (Жесткая заделка левого торца) ---
+def left_face(x):
+    return np.isclose(x[0], 0.0)
 
-# --- 5. Параметры солвера ---
+f_entities = mesh.locate_entities_boundary(msh, 2, left_face)
+dofs = fem.locate_dofs_topological(V, 2, f_entities)
+bc = fem.dirichletbc(np.zeros(3, dtype=PETSc.ScalarType), dofs, V)
+
+# --- 5. РЕШАТЕЛЬ ---
+problem = NonlinearProblem(F_res, u, bcs=[bc], J=J)
 solver = NewtonSolver(msh.comm, problem)
-solver.max_it = 50
-solver.convergence_criterion = "incremental"
 solver.rtol = 1e-6
-solver.report = True
+solver.max_it = 30
 
+# Прямой метод (MUMPS) для стабильности
 ksp = solver.krylov_solver
 ksp.setType("preonly")
 ksp.getPC().setType("lu")
-opts = PETSc.Options()
-opts["pc_factor_mat_solver_type"] = "mumps" 
-ksp.setFromOptions()
+ksp.getPC().setFactorSolverType("mumps")
 
-solver.relaxation_parameter = 1.0
-nsteps = 200
-
-# Проверка связи (нулевой шаг)
-dT_eff.value = 0.0
-it, converged = solver.solve(u)
-if converged:
-    print(f"Нулевой шаг сошелся за {it} итераций")
-else:
-    print("Капец, dT=0 не сходится!")
-
-# --- 7. Расчет напряжений и сохранение ---
+# --- 6. НАПРЯЖЕНИЯ И ЗАПИСЬ ---
 W_stress = fem.functionspace(msh, ("Lagrange", 1))
 stress_field = fem.Function(W_stress)
 stress_field.name = "von_Mises_Stress"
 u.name = "Deformation"
 
-# Формула для Мизеса
+# Формула Мизеса через поля mu и lambda
 E_val = E_GL(u) - alpha_tensor * dT_eff
-S = λ * ufl.tr(E_val) * ufl.Identity(3) + 2.0 * μ * E_val 
-s = S - (1./3) * ufl.tr(S) * ufl.Identity(3)
-von_Mises_expr_ufl = ufl.sqrt(1.5 * ufl.inner(s, s))
+S = lmbda * ufl.tr(E_val) * I + 2.0 * mu * E_val 
+dev_S = S - (1./3) * ufl.tr(S) * I
+von_Mises_ufl = ufl.sqrt(1.5 * ufl.inner(dev_S, dev_S))
+stress_expr = fem.Expression(von_Mises_ufl, W_stress.element.interpolation_points())
 
-# Создаем выражение для интерполяции один раз
-stress_expr = fem.Expression(von_Mises_expr_ufl, W_stress.element.interpolation_points())
+vtx = VTXWriter(msh.comm, "MoCeramic_Cooling.bp", [u, stress_field], engine="BP4")
 
-# Инициализируем VTXWriter (имя файла теперь будет папкой .bp)
-vtx = VTXWriter(msh.comm, "birch_animation.bp", [u, stress_field], engine="BP4")
+# --- 7. ЦИКЛ ОХЛАЖДЕНИЯ (от 1400 до 20 C) ---
+dT_final = -1380.0
+nsteps = 50
 
-print("--- Основной цикл ---")
+print(f"Старт охлаждения: {nsteps} шагов...")
 for i in range(1, nsteps + 1):
-    t = i / nsteps  # Условное время для ParaView
-    dT_eff.value = dT * t
+    t = i / nsteps
+    dT_eff.value = dT_final * t
     
     try:
-        n_it, converged = solver.solve(u)
+        solver.solve(u)
         u.x.scatter_forward()
-        
-        # Обновляем карту напряжений для текущего шага
         stress_field.interpolate(stress_expr)
-        
-        # Записываем в файл VTX
         vtx.write(t)
-        print(f"Шаг {i}/{nsteps} записан")
-        
+        print(f"Шаг {i}/{nsteps}: dT = {dT_eff.value:.1f}")
     except RuntimeError:
-        print(f"Ошибка на {i}-ом шаге!")
+        print("Ошибка сходимости! Попробуй увеличить nsteps.")
         break
-vtx.close()
 
-print("gg wp!")
+vtx.close()
+print("Готово! Результат в MoCeramic_Cooling.bp")
